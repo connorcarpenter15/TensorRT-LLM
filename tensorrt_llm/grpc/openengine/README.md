@@ -1,7 +1,7 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# TensorRT-LLM OpenEngine stub server
+# TensorRT-LLM OpenEngine server
 
 `trtllm-serve` can expose an experimental OpenEngine gRPC server instead of its normal OpenAI HTTP server. SMG remains the default gRPC protocol.
 
@@ -13,7 +13,7 @@ python -m pip install \
   "tensorrt_llm[openengine]"
 ```
 
-Then select OpenEngine when starting the gRPC server:
+Then select OpenEngine when starting an aggregated gRPC server:
 
 ```bash
 trtllm-serve <model> \
@@ -25,7 +25,48 @@ trtllm-serve <model> \
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
 
-This initial integration is a protocol stub. Every OpenEngine RPC returns gRPC status `UNIMPLEMENTED`; no request reaches the TensorRT-LLM engine. OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
+The OpenEngine `Generate` RPC accepts text or token-ID input and streams TensorRT-LLM output. `GetServerInfo` reports the configured aggregated, prefill, or decode role. The other control-plane RPCs remain intentionally `UNIMPLEMENTED`.
+
+## Disaggregated serving
+
+OpenEngine uses TensorRT-LLM's context-first KV transfer. Configure the same cache transceiver backend on both workers:
+
+`context.yml`:
+
+```yaml
+disable_overlap_scheduler: true
+cache_transceiver_config:
+  backend: NIXL
+```
+
+`generation.yml`:
+
+```yaml
+cache_transceiver_config:
+  backend: NIXL
+```
+
+Start one prefill worker and one decode worker on separate GPUs or hosts:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 trtllm-serve <model> \
+  --grpc \
+  --grpc-protocol openengine \
+  --server_role context \
+  --config context.yml \
+  --port 50051
+
+CUDA_VISIBLE_DEVICES=1 trtllm-serve <model> \
+  --grpc \
+  --grpc-protocol openengine \
+  --server_role generation \
+  --config generation.yml \
+  --port 50052
+```
+
+An external OpenEngine router sends the request to the prefill worker, receives a terminal `PrefillReady` response, and forwards its opaque `kv_session` with the original input to the decode worker. The adapter supports text-only context-first handoff. Multimodal input, LoRA selection, and guided decoding are not included in this milestone.
+
+OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
 
 ## Dependency provenance
 

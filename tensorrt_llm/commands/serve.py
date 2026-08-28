@@ -1433,6 +1433,12 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             except ValueError:
                 raise ValueError(f"Invalid server role: {server_role}. " \
                                 f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+        elif grpc and grpc_protocol == "openengine" and server_role is not None:
+            try:
+                server_role = ServerRole[server_role.upper()]
+            except KeyError:
+                raise ValueError(f"Invalid server role: {server_role}. " \
+                                f"Must be one of: {', '.join([role.name for role in ServerRole])}")
         # Parse media_io_kwargs from JSON string to dict if provided
         parsed_media_io_kwargs = None
         if media_io_kwargs is not None:
@@ -1465,11 +1471,11 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 internal_disagg_auth_key,
                 "metadata_server_config_file":
                 metadata_server_config_file,
-                "server_role":
-                server_role,
                 "disagg_cluster_config":
                 disagg_cluster_config,
             }
+            if grpc_protocol == "smg":
+                unsupported_args["server_role"] = server_role
             for name, value in unsupported_args.items():
                 if value is not None:
                     raise ValueError(
@@ -1501,7 +1507,11 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         "https://buf.build/gen/python "
                         "\"tensorrt_llm[openengine]\"`.") from error
 
-                launch_grpc_server(host, port)
+                launch_grpc_server(host,
+                                   port,
+                                   llm_args,
+                                   served_model_name=served_model_name,
+                                   server_role=server_role)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
