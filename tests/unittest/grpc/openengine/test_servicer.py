@@ -12,7 +12,7 @@ pytest.importorskip(
     reason='OpenEngine bindings are not installed (pip install "tensorrt_llm[openengine]")',
 )
 
-from openengine.v1 import generation_pb2, server_pb2  # noqa: E402
+from openengine.v1 import generation_pb2, model_pb2, server_pb2  # noqa: E402
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineServicer  # noqa: E402
@@ -83,6 +83,23 @@ class _Llm:
 
 async def _collect(servicer, request):
     return [response async for response in servicer.Generate(request, _Context())]
+
+
+@pytest.mark.asyncio
+async def test_model_info_distinguishes_canonical_and_served_names():
+    """Regression: discovery must not use a served alias as the tokenizer source."""
+    llm = _Llm(_Result)
+    llm.args.model = "org/model"
+    servicer = OpenEngineServicer(llm, "served-alias", server_pb2.ENGINE_ROLE_AGGREGATED)
+
+    info = await servicer.GetModelInfo(
+        model_pb2.GetModelInfoRequest(model="served-alias"),
+        _Context(),
+    )
+
+    assert info.model_id == "org/model"
+    assert info.served_model_name == "served-alias"
+    assert list(info.served_model_aliases) == ["org/model"]
 
 
 @pytest.mark.asyncio

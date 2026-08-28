@@ -10,7 +10,14 @@ from dataclasses import replace
 from typing import Any
 
 import grpc
-from openengine.v1 import error_pb2, generation_pb2, kv_pb2, openengine_pb2_grpc, server_pb2
+from openengine.v1 import (
+    error_pb2,
+    generation_pb2,
+    kv_pb2,
+    model_pb2,
+    openengine_pb2_grpc,
+    server_pb2,
+)
 
 import tensorrt_llm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -54,7 +61,7 @@ class OpenEngineServicer(
     openengine_pb2_grpc.InferenceServicer,
     openengine_pb2_grpc.ControlServicer,
 ):
-    """Implement OpenEngine generation and server-role discovery."""
+    """Implement OpenEngine generation and server/model discovery."""
 
     def __init__(self, llm: object, model: str, role: int) -> None:
         if role not in (
@@ -65,8 +72,8 @@ class OpenEngineServicer(
             raise ValueError(f"Unsupported OpenEngine role {role}")
         self.llm = llm
         self.model = model
-        model_id = str(_arg(llm, "model", model) or model)
-        self._accepted_model_names = {model, model_id}
+        self.model_id = str(_arg(llm, "model", model) or model)
+        self._accepted_model_names = {model, self.model_id}
         self.role = role
         self.instance_id = str(uuid.uuid4())
         self._requests: dict[str, object] = {}
@@ -443,6 +450,23 @@ class OpenEngineServicer(
                     logger.warning("Failed to abort OpenEngine request %s", request.request_id)
             if self._requests.get(request.request_id) is result:
                 self._requests.pop(request.request_id, None)
+
+    async def GetModelInfo(
+        self,
+        request: model_pb2.GetModelInfoRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> model_pb2.ModelInfo:
+        """Return the canonical and served identities for the requested model."""
+        if not request.model or request.model not in self._accepted_model_names:
+            await context.abort(grpc.StatusCode.NOT_FOUND, f"Unknown model {request.model!r}")
+        aliases = [self.model_id] if self.model_id != self.model else []
+        return model_pb2.ModelInfo(
+            model_id=self.model_id,
+            served_model_name=self.model,
+            served_model_aliases=aliases,
+            supports_text_input=True,
+            supports_token_ids_input=True,
+        )
 
     async def GetServerInfo(
         self,

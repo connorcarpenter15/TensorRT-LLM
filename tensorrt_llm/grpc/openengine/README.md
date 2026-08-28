@@ -25,7 +25,7 @@ trtllm-serve <model> \
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
 
-The OpenEngine `Generate` RPC accepts text or token-ID input and streams TensorRT-LLM output. `GetServerInfo` reports the configured aggregated, prefill, or decode role. The other control-plane RPCs remain intentionally `UNIMPLEMENTED`.
+The OpenEngine `Generate` RPC accepts text or token-ID input and streams TensorRT-LLM output. `GetServerInfo` reports the configured aggregated, prefill, or decode role, and `GetModelInfo` reports the canonical model source separately from its served name. The other control-plane RPCs remain intentionally `UNIMPLEMENTED`.
 
 ## Disaggregated serving
 
