@@ -63,7 +63,13 @@ class OpenEngineServicer(
 ):
     """Implement OpenEngine generation and server/model discovery."""
 
-    def __init__(self, llm: object, model: str, role: int) -> None:
+    def __init__(
+        self,
+        llm: object,
+        model: str,
+        role: int,
+        internal_disagg_auth_key: str | None = None,
+    ) -> None:
         if role not in (
             server_pb2.ENGINE_ROLE_AGGREGATED,
             server_pb2.ENGINE_ROLE_PREFILL,
@@ -75,6 +81,7 @@ class OpenEngineServicer(
         self.model_id = str(_arg(llm, "model", model) or model)
         self._accepted_model_names = {model, self.model_id}
         self.role = role
+        self.internal_disagg_auth_key = internal_disagg_auth_key
         self.instance_id = str(uuid.uuid4())
         self._requests: dict[str, object] = {}
 
@@ -180,7 +187,7 @@ class OpenEngineServicer(
                 ctx_dp_rank=target_dp_rank,
                 schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
             )
-        return decode_handoff(request.kv.session)
+        return decode_handoff(request.kv.session, self.internal_disagg_auth_key)
 
     def _context_info_endpoint(self) -> str | None:
         params = getattr(self.llm, "disaggregated_params", None)
@@ -236,9 +243,22 @@ class OpenEngineServicer(
         prompt_logprobs = result.outputs[0].prompt_logprobs
         if not prompt_logprobs:
             return None
-        return generation_pb2.PromptOutput(
-            tokens=self._token_infos(list(result.prompt_token_ids), list(prompt_logprobs))
+        prompt_token_ids = list(result.prompt_token_ids)
+        if not prompt_token_ids:
+            return None
+        tokens = [
+            generation_pb2.TokenInfo(
+                token_id=prompt_token_ids[0],
+                token=self._token_text(prompt_token_ids[0]),
+            )
+        ]
+        tokens.extend(
+            self._token_infos(
+                prompt_token_ids[1:],
+                list(prompt_logprobs)[: len(prompt_token_ids) - 1],
+            )
         )
+        return generation_pb2.PromptOutput(tokens=tokens)
 
     @staticmethod
     def _usage(
@@ -272,7 +292,7 @@ class OpenEngineServicer(
         }
 
     @staticmethod
-    def _finished(output: object) -> generation_pb2.GenerationFinished:
+    def _finished(output: object, eos_token_id: int | None) -> generation_pb2.GenerationFinished:
         reason_map = {
             "stop": generation_pb2.FINISH_REASON_STOP,
             "length": generation_pb2.FINISH_REASON_LENGTH,
@@ -287,6 +307,8 @@ class OpenEngineServicer(
             finished.stop_match.stop_token_id = output.stop_reason
         elif isinstance(output.stop_reason, str):
             finished.stop_match.stop_text = output.stop_reason
+        elif output.finish_reason == "stop" and eos_token_id is not None:
+            finished.stop_match.eos_token_id = eos_token_id
         return finished
 
     async def Generate(
@@ -390,7 +412,7 @@ class OpenEngineServicer(
                         yield generation_pb2.GenerateResponse(
                             request_id=request.request_id,
                             prefill_ready=generation_pb2.PrefillReady(
-                                kv_session=encode_handoff(handoff)
+                                kv_session=encode_handoff(handoff, self.internal_disagg_auth_key)
                             ),
                             usage=self._usage(current),
                         )
@@ -422,7 +444,14 @@ class OpenEngineServicer(
                     for index, output in enumerate(current.outputs):
                         response = generation_pb2.GenerateResponse(
                             request_id=request.request_id,
-                            finished=self._finished(output),
+                            finished=self._finished(
+                                output,
+                                getattr(
+                                    getattr(result, "sampling_params", None),
+                                    "end_id",
+                                    None,
+                                ),
+                            ),
                         )
                         if index == len(current.outputs) - 1:
                             response.usage.CopyFrom(self._usage(current, context_usage))

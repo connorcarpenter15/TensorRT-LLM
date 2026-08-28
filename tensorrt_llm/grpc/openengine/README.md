@@ -35,6 +35,7 @@ OpenEngine uses TensorRT-LLM's context-first KV transfer. Configure the same cac
 
 ```yaml
 disable_overlap_scheduler: true
+internal_request_auth_key: "<shared-secret>"
 cache_transceiver_config:
   backend: NIXL
 ```
@@ -42,6 +43,7 @@ cache_transceiver_config:
 `generation.yml`:
 
 ```yaml
+internal_request_auth_key: "<shared-secret>"
 cache_transceiver_config:
   backend: NIXL
 ```
@@ -64,7 +66,7 @@ CUDA_VISIBLE_DEVICES=1 trtllm-serve <model> \
   --port 50052
 ```
 
-An external OpenEngine router sends the request to the prefill worker, receives a terminal `PrefillReady` response, and forwards its opaque `kv_session` with the original input to the decode worker. The adapter supports text-only context-first handoff. Multimodal input, LoRA selection, and guided decoding are not included in this milestone.
+An external OpenEngine router sends the request to the prefill worker, receives a terminal `PrefillReady` response, and forwards its opaque `kv_session` with the original input to the decode worker. Configure the same non-empty `internal_request_auth_key` on both workers so the prefill worker signs protected rendezvous fields and the decode worker rejects a missing or modified signature. The adapter supports text-only context-first handoff. Multimodal input, LoRA selection, and guided decoding are not included in this milestone.
 
 OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
 

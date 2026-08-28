@@ -1467,8 +1467,6 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
-                "internal_request_auth_key":
-                internal_disagg_auth_key,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "disagg_cluster_config":
@@ -1476,6 +1474,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             }
             if grpc_protocol == "smg":
                 unsupported_args["server_role"] = server_role
+                unsupported_args[
+                    "internal_request_auth_key"] = internal_disagg_auth_key
             for name, value in unsupported_args.items():
                 if value is not None:
                     raise ValueError(
@@ -1507,11 +1507,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         "https://buf.build/gen/python "
                         "\"tensorrt_llm[openengine]\"`.") from error
 
-                launch_grpc_server(host,
-                                   port,
-                                   llm_args,
-                                   served_model_name=served_model_name,
-                                   server_role=server_role)
+                launch_grpc_server(
+                    host,
+                    port,
+                    llm_args,
+                    served_model_name=served_model_name,
+                    server_role=server_role,
+                    internal_disagg_auth_key=internal_disagg_auth_key)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

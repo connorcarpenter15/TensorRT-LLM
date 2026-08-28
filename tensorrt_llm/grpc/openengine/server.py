@@ -62,10 +62,16 @@ class OpenEngineServer:
         role: int,
         host: str,
         port: int,
+        internal_disagg_auth_key: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
-        self.servicer = OpenEngineServicer(llm=llm, model=model, role=role)
+        self.servicer = OpenEngineServicer(
+            llm=llm,
+            model=model,
+            role=role,
+            internal_disagg_auth_key=internal_disagg_auth_key,
+        )
         self._server = grpc.aio.server(
             options=[
                 ("grpc.max_send_message_length", _GRPC_MAX_MESSAGE_LENGTH_BYTES),
@@ -105,6 +111,7 @@ def launch_server(
     llm_args: dict[str, Any],
     served_model_name: str | None = None,
     server_role: object | None = None,
+    internal_disagg_auth_key: str | None = None,
 ) -> None:
     """Load a model and launch the dedicated OpenEngine gRPC server."""
 
@@ -137,6 +144,7 @@ def launch_server(
                 role=role,
                 host=host,
                 port=port,
+                internal_disagg_auth_key=internal_disagg_auth_key,
             )
             await server.start()
             logger.info("Model loaded successfully; OpenEngine is ready to accept requests")

@@ -15,6 +15,12 @@ pytest.importorskip(
 from openengine.v1 import generation_pb2, model_pb2, server_pb2  # noqa: E402
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle  # noqa: E402
+from tensorrt_llm.grpc.openengine.converters import (  # noqa: E402
+    HANDOFF_ATTRIBUTE,
+    decode_handoff,
+    encode_handoff,
+    to_sampling_params,
+)
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineServicer  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
@@ -49,6 +55,7 @@ class _Result:
         self.cached_tokens = 0
         self.finished = True
         self.disaggregated_params = disaggregated_params
+        self.sampling_params = SimpleNamespace(end_id=2)
 
     def __aiter__(self):
         async def items():
@@ -118,8 +125,41 @@ async def test_aggregated_generate_streams_engine_output():
         "finished",
     ]
     assert [token.token_id for token in responses[0].token.tokens] == [7, 8]
+    assert responses[-1].finished.stop_match.eos_token_id == 2
     assert responses[-1].usage.prompt_tokens == 2
     assert llm.calls[0]["disaggregated_params"] is None
+
+
+@pytest.mark.asyncio
+async def test_prompt_logprobs_align_with_scored_prompt_tokens():
+    """Regression: TRT prompt scores are offset and exclude the first prompt token."""
+    result = _Result()
+    result.prompt_token_ids = [10, 11]
+    result.outputs[0].prompt_logprobs = [-0.25, -0.5]
+    servicer = OpenEngineServicer(
+        _Llm(lambda: result),
+        "model",
+        server_pb2.ENGINE_ROLE_AGGREGATED,
+    )
+
+    responses = await _collect(
+        servicer,
+        generation_pb2.GenerateRequest(request_id="prompt-logprobs", prompt="Hi"),
+    )
+
+    prompt_tokens = responses[0].prompt.tokens
+    assert [token.token_id for token in prompt_tokens] == [10, 11]
+    assert not prompt_tokens[0].HasField("logprob")
+    assert prompt_tokens[1].logprob == pytest.approx(-0.25)
+
+
+def test_explicit_zero_num_sequences_is_rejected():
+    """Regression: OpenEngine requires an explicitly provided sequence count to be positive."""
+    request = generation_pb2.GenerateRequest(request_id="zero-sequences", prompt="Hi")
+    request.sampling.num_sequences = 0
+
+    with pytest.raises(ValueError, match="num_sequences must be greater than zero"):
+        to_sampling_params(request)
 
 
 @pytest.mark.asyncio
@@ -138,6 +178,7 @@ async def test_prefill_handoff_round_trips_to_decode_params():
         _Llm(lambda: _Result(handoff)),
         "model",
         server_pb2.ENGINE_ROLE_PREFILL,
+        internal_disagg_auth_key="secret",
     )
 
     prefill_responses = await _collect(
@@ -147,7 +188,12 @@ async def test_prefill_handoff_round_trips_to_decode_params():
     session = prefill_responses[0].prefill_ready.kv_session
 
     decode_llm = _Llm(_Result)
-    decode = OpenEngineServicer(decode_llm, "model", server_pb2.ENGINE_ROLE_DECODE)
+    decode = OpenEngineServicer(
+        decode_llm,
+        "model",
+        server_pb2.ENGINE_ROLE_DECODE,
+        internal_disagg_auth_key="secret",
+    )
     request = generation_pb2.GenerateRequest(request_id="decode", prompt="Hi")
     request.kv.session.CopyFrom(session)
     decode_responses = await _collect(decode, request)
@@ -162,3 +208,24 @@ async def test_prefill_handoff_round_trips_to_decode_params():
     assert params.disagg_request_id == 88
     assert params.opaque_state == b"opaque"
     assert decode_responses[-1].WhichOneof("event") == "finished"
+
+
+def test_authenticated_handoff_rejects_tampered_rendezvous_fields():
+    """Regression: clients must not be able to replace protected TRT-LLM handoff data."""
+    session = encode_handoff(
+        DisaggregatedParams(
+            request_type="context_only",
+            ctx_request_id=77,
+            opaque_state=b"opaque",
+            disagg_request_id=88,
+            ctx_info_endpoint="ctx:1234",
+            schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+        ),
+        internal_disagg_auth_key="secret",
+    )
+    session.attributes_struct.fields[HANDOFF_ATTRIBUTE].struct_value.fields[
+        "ctx_info_endpoint"
+    ].string_value = "attacker:9999"
+
+    with pytest.raises(ValueError, match="Invalid internal"):
+        decode_handoff(session, internal_disagg_auth_key="secret")

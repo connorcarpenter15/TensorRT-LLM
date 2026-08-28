@@ -14,8 +14,13 @@ from openengine.v1 import generation_pb2, kv_pb2
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.serve.disagg_auth import (
+    build_internal_disagg_auth_signature,
+    validate_internal_disagg_auth_signature,
+)
 
 HANDOFF_ATTRIBUTE = "tensorrt_llm.disaggregated_params.v1"
+HANDOFF_AUTH_ATTRIBUTE = "tensorrt_llm.disaggregated_auth.v1"
 
 
 def _optional(message: object, field: str) -> Any | None:
@@ -56,6 +61,8 @@ def to_sampling_params(request: generation_pb2.GenerateRequest) -> SamplingParam
 
     num_sequences = _optional(sampling, "num_sequences")
     if num_sequences is not None:
+        if num_sequences == 0:
+            raise ValueError("num_sequences must be greater than zero")
         kwargs["n"] = num_sequences
         kwargs["best_of"] = num_sequences
     min_tokens = _optional(stopping, "min_tokens")
@@ -129,7 +136,10 @@ def _struct_value(value: Any) -> Any:
     return value
 
 
-def encode_handoff(params: DisaggregatedParams) -> kv_pb2.KvSessionRef:
+def encode_handoff(
+    params: DisaggregatedParams,
+    internal_disagg_auth_key: str | None = None,
+) -> kv_pb2.KvSessionRef:
     """Encode a context-first TensorRT-LLM KV handoff."""
     unsupported = {
         "first-generation logits": params.first_gen_logits,
@@ -171,6 +181,13 @@ def encode_handoff(params: DisaggregatedParams) -> kv_pb2.KvSessionRef:
         dp_rank=params.ctx_dp_rank or 0,
     )
     session.attributes_struct[HANDOFF_ATTRIBUTE] = payload
+    signature = build_internal_disagg_auth_signature(
+        internal_disagg_auth_key,
+        payload["opaque_state"],
+        payload["ctx_info_endpoint"],
+    )
+    if signature is not None:
+        session.attributes_struct[HANDOFF_AUTH_ATTRIBUTE] = signature
     return session
 
 
@@ -277,11 +294,23 @@ def _ctx_usage(payload: dict[str, Any]) -> dict[str, Any] | None:
     return output
 
 
-def decode_handoff(session: kv_pb2.KvSessionRef) -> DisaggregatedParams:
+def decode_handoff(
+    session: kv_pb2.KvSessionRef,
+    internal_disagg_auth_key: str | None = None,
+) -> DisaggregatedParams:
     """Decode and validate a context-first TensorRT-LLM KV handoff."""
     payload = _handoff_payload(session)
     if payload.get("schedule_style") != "context_first":
         raise ValueError("OpenEngine supports context-first handoff only")
+    auth_value = session.attributes_struct.fields.get(HANDOFF_AUTH_ATTRIBUTE)
+    if auth_value is not None and auth_value.WhichOneof("kind") != "string_value":
+        raise ValueError(f"KV session has invalid {HANDOFF_AUTH_ATTRIBUTE!r}")
+    validate_internal_disagg_auth_signature(
+        internal_disagg_auth_key,
+        payload.get("opaque_state"),
+        payload.get("ctx_info_endpoint"),
+        None if auth_value is None else auth_value.string_value,
+    )
     opaque = payload.get("opaque_state")
     try:
         opaque_state = None if opaque is None else base64.b64decode(opaque, validate=True)
@@ -319,6 +348,7 @@ def decode_handoff(session: kv_pb2.KvSessionRef) -> DisaggregatedParams:
 
 
 __all__ = [
+    "HANDOFF_AUTH_ATTRIBUTE",
     "HANDOFF_ATTRIBUTE",
     "decode_handoff",
     "encode_handoff",
