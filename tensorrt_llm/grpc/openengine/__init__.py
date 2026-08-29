@@ -3,6 +3,6 @@
 
 """OpenEngine gRPC integration for TensorRT-LLM."""
 
-from .server import OpenEngineServer, launch_server
+from .server import OpenEngineServer, launch_server, openengine_role
 
-__all__ = ["OpenEngineServer", "launch_server"]
+__all__ = ["OpenEngineServer", "launch_server", "openengine_role"]

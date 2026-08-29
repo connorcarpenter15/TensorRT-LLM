@@ -12,16 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
-import hmac
-import json
-import warnings
-from typing import Any, Mapping, Optional
+from __future__ import annotations
 
-from tensorrt_llm.serve.openai_protocol import UCompletionRequest
+import warnings
+from typing import TYPE_CHECKING, Any, Mapping, Optional
+
+from tensorrt_llm.disagg_auth import sign_disaggregated_payload, validate_disaggregated_payload
+
+if TYPE_CHECKING:
+    from tensorrt_llm.serve.openai_protocol import UCompletionRequest
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
-_SIGNATURE_PREFIX = "sha256="
 _INTERNAL_DISAGG_AUTH_FIELDS = ("encoded_opaque_state", "ctx_info_endpoint")
 _MISSING_AUTH_KEY_WARNING = (
     "Internal disaggregated authentication key is required for protected "
@@ -53,23 +54,12 @@ def _canonical_ctx_info_endpoint(endpoint: Any) -> Any:
     return endpoint
 
 
-def _auth_payload(request: UCompletionRequest) -> bytes:
+def _auth_payload(request: UCompletionRequest) -> dict[str, Any]:
     disaggregated_params = request.disaggregated_params
-    payload = {
-        field_name: _canonical_ctx_info_endpoint(value)
-        if field_name == "ctx_info_endpoint"
-        else value
-        for field_name in get_internal_disagg_auth_fields()
-        for value in [getattr(disaggregated_params, field_name)]
+    return {
+        "ctx_info_endpoint": _canonical_ctx_info_endpoint(disaggregated_params.ctx_info_endpoint),
+        "encoded_opaque_state": disaggregated_params.encoded_opaque_state,
     }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def _sign_request(internal_disagg_auth_key: str, request: UCompletionRequest) -> str:
-    signature = hmac.new(
-        internal_disagg_auth_key.encode("utf-8"), _auth_payload(request), hashlib.sha256
-    ).hexdigest()
-    return f"{_SIGNATURE_PREFIX}{signature}"
 
 
 def build_internal_disagg_auth_headers(
@@ -81,7 +71,8 @@ def build_internal_disagg_auth_headers(
     if not internal_disagg_auth_key:
         _warn_missing_auth_key()
         return {}
-    return {INTERNAL_DISAGG_AUTH_HEADER: _sign_request(internal_disagg_auth_key, request)}
+    signature = sign_disaggregated_payload(internal_disagg_auth_key, _auth_payload(request))
+    return {INTERNAL_DISAGG_AUTH_HEADER: signature}
 
 
 def validate_internal_disagg_request(
@@ -94,10 +85,9 @@ def validate_internal_disagg_request(
     if not internal_disagg_auth_key:
         _warn_missing_auth_key()
         return
-
-    expected = _sign_request(internal_disagg_auth_key, request)
     provided = None if headers is None else headers.get(INTERNAL_DISAGG_AUTH_HEADER)
-    if provided is None or not hmac.compare_digest(
-        provided.encode("utf-8"), expected.encode("utf-8")
-    ):
-        raise ValueError("Invalid internal disaggregated request authentication")
+    validate_disaggregated_payload(
+        internal_disagg_auth_key,
+        _auth_payload(request),
+        provided,
+    )
