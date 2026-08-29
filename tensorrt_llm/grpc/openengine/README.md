@@ -25,7 +25,7 @@ trtllm-serve <model> \
 
 Existing `--grpc` invocations continue to select SMG. OpenEngine and VisualGen cannot be enabled together.
 
-The OpenEngine `Generate` RPC accepts text or token-ID input and streams TensorRT-LLM output. `GetServerInfo` reports the configured aggregated, prefill, or decode role, and `GetModelInfo` reports the canonical model source separately from its served name. The other control-plane RPCs remain intentionally `UNIMPLEMENTED`.
+The OpenEngine `Generate` RPC accepts text or token-ID input and streams TensorRT-LLM output. Both input modes require tokenizer initialization; `skip_tokenizer_init` is not supported. `GetServerInfo` reports the configured aggregated, prefill, or decode role, and `GetModelInfo` reports the canonical model source separately from its served name. The other control-plane RPCs remain intentionally `UNIMPLEMENTED`.
 
 ## Disaggregated serving
 
@@ -66,7 +66,7 @@ CUDA_VISIBLE_DEVICES=1 trtllm-serve <model> \
   --port 50052
 ```
 
-An external OpenEngine router sends the request to the prefill worker, receives a terminal `PrefillReady` response, and forwards its opaque `kv_session` with the original input to the decode worker. Configure the same non-empty `internal_request_auth_key` on both workers so the prefill worker signs protected rendezvous fields and the decode worker rejects a missing or modified signature. The adapter supports text-only context-first handoff. Multimodal input, LoRA selection, and guided decoding are not included in this milestone.
+An external OpenEngine router sends the request to the prefill worker, receives a terminal `PrefillReady` response, and forwards its opaque `kv_session` with the original input to the decode worker. Configure the same non-empty `internal_request_auth_key` on both workers. The prefill worker signs the complete versioned handoff, including routing and token state, and the decode worker rejects a missing or modified signature or inconsistent outer session fields. The adapter supports text-only context-first handoff. Multimodal input, LoRA selection, and guided decoding are not included in this milestone.
 
 OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
 

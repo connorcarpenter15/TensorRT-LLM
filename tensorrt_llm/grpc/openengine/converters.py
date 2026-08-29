@@ -4,23 +4,20 @@
 """Conversions between OpenEngine messages and TensorRT-LLM API objects."""
 
 import base64
-import hashlib
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from google.protobuf.json_format import MessageToDict
 from openengine.v1 import generation_pb2, kv_pb2
 
+from tensorrt_llm.disagg_auth import sign_disaggregated_payload, validate_disaggregated_payload
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.sampling_params import SamplingParams
-from tensorrt_llm.serve.disagg_auth import (
-    build_internal_disagg_auth_signature,
-    validate_internal_disagg_auth_signature,
-)
 
 HANDOFF_ATTRIBUTE = "tensorrt_llm.disaggregated_params.v1"
 HANDOFF_AUTH_ATTRIBUTE = "tensorrt_llm.disaggregated_auth.v1"
+HANDOFF_SIGNATURE_VERSION = 1
 
 
 def _optional(message: object, field: str) -> Any | None:
@@ -114,12 +111,6 @@ def to_priority(priority: int | None) -> float:
     return 0.5 + 0.5 * priority / (1 + abs(priority))
 
 
-def stable_request_id(request_id: str) -> int:
-    """Map arbitrary wire request IDs into TensorRT-LLM's positive int64 domain."""
-    digest = hashlib.sha256(request_id.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
-
-
 def _struct_value(value: Any) -> Any:
     if is_dataclass(value):
         return _struct_value(asdict(value))
@@ -154,9 +145,12 @@ def encode_handoff(
     if params.schedule_style not in (None, DisaggScheduleStyle.CONTEXT_FIRST):
         raise ValueError("OpenEngine supports context-first handoff only")
 
-    session_id = params.disagg_request_id or params.ctx_request_id
+    session_id = (
+        params.disagg_request_id if params.disagg_request_id is not None else params.ctx_request_id
+    )
     if session_id is None:
         raise ValueError("Context-only result did not provide a request ID")
+    ctx_dp_rank = 0 if params.ctx_dp_rank is None else params.ctx_dp_rank
     payload = {
         "first_gen_tokens": _struct_value(params.first_gen_tokens),
         "first_gen_log_probs": _struct_value(params.first_gen_log_probs),
@@ -164,7 +158,7 @@ def encode_handoff(
         "disagg_request_id": (
             None if params.disagg_request_id is None else str(params.disagg_request_id)
         ),
-        "ctx_dp_rank": params.ctx_dp_rank,
+        "ctx_dp_rank": ctx_dp_rank,
         "ctx_info_endpoint": params.ctx_info_endpoint,
         "draft_tokens": _struct_value(params.draft_tokens),
         "ctx_usage": _struct_value(params.ctx_usage),
@@ -178,16 +172,14 @@ def encode_handoff(
     session = kv_pb2.KvSessionRef(
         session_id=str(session_id),
         transfer_backend="tensorrt_llm",
-        dp_rank=params.ctx_dp_rank or 0,
+        dp_rank=ctx_dp_rank,
     )
     session.attributes_struct[HANDOFF_ATTRIBUTE] = payload
-    signature = build_internal_disagg_auth_signature(
+    signature = sign_disaggregated_payload(
         internal_disagg_auth_key,
-        payload["opaque_state"],
-        payload["ctx_info_endpoint"],
+        _handoff_auth_payload(session, _handoff_payload(session)),
     )
-    if signature is not None:
-        session.attributes_struct[HANDOFF_AUTH_ATTRIBUTE] = signature
+    session.attributes_struct[HANDOFF_AUTH_ATTRIBUTE] = signature
     return session
 
 
@@ -199,6 +191,29 @@ def _handoff_payload(session: kv_pb2.KvSessionRef) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("TensorRT-LLM handoff must contain an object")
     return payload
+
+
+def _handoff_auth_payload(
+    session: kv_pb2.KvSessionRef,
+    handoff: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "version": HANDOFF_SIGNATURE_VERSION,
+        "session": {
+            "session_id": session.session_id,
+            "transfer_backend": session.transfer_backend,
+            "dp_rank": session.dp_rank,
+            "endpoints": [
+                {
+                    "host": endpoint.host,
+                    "port": endpoint.port,
+                    "protocol": endpoint.protocol,
+                }
+                for endpoint in session.endpoints
+            ],
+        },
+        "handoff": handoff,
+    }
 
 
 def _decimal_id(payload: dict[str, Any], name: str) -> int | None:
@@ -299,18 +314,19 @@ def decode_handoff(
     internal_disagg_auth_key: str | None = None,
 ) -> DisaggregatedParams:
     """Decode and validate a context-first TensorRT-LLM KV handoff."""
+    if session.transfer_backend != "tensorrt_llm":
+        raise ValueError("Decode KV session was not produced by TensorRT-LLM")
     payload = _handoff_payload(session)
-    if payload.get("schedule_style") != "context_first":
-        raise ValueError("OpenEngine supports context-first handoff only")
     auth_value = session.attributes_struct.fields.get(HANDOFF_AUTH_ATTRIBUTE)
     if auth_value is not None and auth_value.WhichOneof("kind") != "string_value":
         raise ValueError(f"KV session has invalid {HANDOFF_AUTH_ATTRIBUTE!r}")
-    validate_internal_disagg_auth_signature(
+    validate_disaggregated_payload(
         internal_disagg_auth_key,
-        payload.get("opaque_state"),
-        payload.get("ctx_info_endpoint"),
+        _handoff_auth_payload(session, payload),
         None if auth_value is None else auth_value.string_value,
     )
+    if payload.get("schedule_style") != "context_first":
+        raise ValueError("OpenEngine supports context-first handoff only")
     opaque = payload.get("opaque_state")
     try:
         opaque_state = None if opaque is None else base64.b64decode(opaque, validate=True)
@@ -318,8 +334,6 @@ def decode_handoff(
         raise ValueError("opaque_state must be canonical base64") from error
 
     ctx_dp_rank = payload.get("ctx_dp_rank")
-    if ctx_dp_rank is None:
-        ctx_dp_rank = session.dp_rank
     if (
         not isinstance(ctx_dp_rank, (int, float))
         or isinstance(ctx_dp_rank, bool)
@@ -327,19 +341,29 @@ def decode_handoff(
         or ctx_dp_rank < 0
     ):
         raise ValueError("ctx_dp_rank must be a non-negative integer")
+    if int(ctx_dp_rank) != session.dp_rank:
+        raise ValueError("KV session dp_rank does not match the signed handoff ctx_dp_rank")
 
     ctx_info_endpoint = payload.get("ctx_info_endpoint")
     if ctx_info_endpoint is not None and not isinstance(ctx_info_endpoint, str):
         raise ValueError("ctx_info_endpoint must be a string")
 
+    ctx_request_id = _decimal_id(payload, "ctx_request_id")
+    disagg_request_id = _decimal_id(payload, "disagg_request_id")
+    expected_session_id = disagg_request_id if disagg_request_id is not None else ctx_request_id
+    if expected_session_id is None:
+        raise ValueError("TensorRT-LLM handoff did not provide a request ID")
+    if session.session_id != str(expected_session_id):
+        raise ValueError("KV session_id does not match the signed handoff request ID")
+
     return DisaggregatedParams(
         request_type="generation_only",
         first_gen_tokens=_integer_list(payload, "first_gen_tokens"),
         first_gen_log_probs=_logprobs(payload),
-        ctx_request_id=_decimal_id(payload, "ctx_request_id"),
+        ctx_request_id=ctx_request_id,
         opaque_state=opaque_state,
         draft_tokens=_integer_list(payload, "draft_tokens"),
-        disagg_request_id=_decimal_id(payload, "disagg_request_id"),
+        disagg_request_id=disagg_request_id,
         ctx_dp_rank=int(ctx_dp_rank),
         ctx_info_endpoint=ctx_info_endpoint,
         schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
@@ -350,9 +374,9 @@ def decode_handoff(
 __all__ = [
     "HANDOFF_AUTH_ATTRIBUTE",
     "HANDOFF_ATTRIBUTE",
+    "HANDOFF_SIGNATURE_VERSION",
     "decode_handoff",
     "encode_handoff",
-    "stable_request_id",
     "to_priority",
     "to_sampling_params",
 ]

@@ -14,17 +14,15 @@
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
 import warnings
 from typing import TYPE_CHECKING, Any, Mapping, Optional
+
+from tensorrt_llm.disagg_auth import sign_disaggregated_payload, validate_disaggregated_payload
 
 if TYPE_CHECKING:
     from tensorrt_llm.serve.openai_protocol import UCompletionRequest
 
 INTERNAL_DISAGG_AUTH_HEADER = "x-trtllm-disagg-auth"
-_SIGNATURE_PREFIX = "sha256="
 _INTERNAL_DISAGG_AUTH_FIELDS = ("encoded_opaque_state", "ctx_info_endpoint")
 _MISSING_AUTH_KEY_WARNING = (
     "Internal disaggregated authentication key is required for protected "
@@ -56,77 +54,24 @@ def _canonical_ctx_info_endpoint(endpoint: Any) -> Any:
     return endpoint
 
 
-def _auth_payload(encoded_opaque_state: Optional[str], ctx_info_endpoint: Any) -> bytes:
-    payload = {
-        "ctx_info_endpoint": _canonical_ctx_info_endpoint(ctx_info_endpoint),
-        "encoded_opaque_state": encoded_opaque_state,
+def _auth_payload(request: UCompletionRequest) -> dict[str, Any]:
+    disaggregated_params = request.disaggregated_params
+    return {
+        "ctx_info_endpoint": _canonical_ctx_info_endpoint(disaggregated_params.ctx_info_endpoint),
+        "encoded_opaque_state": disaggregated_params.encoded_opaque_state,
     }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def _sign_fields(
-    internal_disagg_auth_key: str,
-    encoded_opaque_state: Optional[str],
-    ctx_info_endpoint: Any,
-) -> str:
-    signature = hmac.new(
-        internal_disagg_auth_key.encode("utf-8"),
-        _auth_payload(encoded_opaque_state, ctx_info_endpoint),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"{_SIGNATURE_PREFIX}{signature}"
-
-
-def build_internal_disagg_auth_signature(
-    internal_disagg_auth_key: Optional[str],
-    encoded_opaque_state: Optional[str],
-    ctx_info_endpoint: Any,
-) -> Optional[str]:
-    """Sign protected disaggregated fields for any transport."""
-    if encoded_opaque_state is None and ctx_info_endpoint is None:
-        return None
-    if not internal_disagg_auth_key:
-        _warn_missing_auth_key()
-        return None
-    return _sign_fields(internal_disagg_auth_key, encoded_opaque_state, ctx_info_endpoint)
-
-
-def validate_internal_disagg_auth_signature(
-    internal_disagg_auth_key: Optional[str],
-    encoded_opaque_state: Optional[str],
-    ctx_info_endpoint: Any,
-    provided: Optional[str],
-) -> None:
-    """Validate protected disaggregated fields for any transport."""
-    if encoded_opaque_state is None and ctx_info_endpoint is None:
-        return
-    if not internal_disagg_auth_key:
-        _warn_missing_auth_key()
-        return
-
-    expected = _sign_fields(internal_disagg_auth_key, encoded_opaque_state, ctx_info_endpoint)
-    try:
-        valid = provided is not None and hmac.compare_digest(
-            provided.encode("utf-8"), expected.encode("utf-8")
-        )
-    except (AttributeError, UnicodeEncodeError):
-        valid = False
-    if not valid:
-        raise ValueError("Invalid internal disaggregated request authentication")
 
 
 def build_internal_disagg_auth_headers(
     internal_disagg_auth_key: Optional[str],
     request: UCompletionRequest,
 ) -> dict[str, str]:
-    disaggregated_params = request.disaggregated_params
-    signature = build_internal_disagg_auth_signature(
-        internal_disagg_auth_key,
-        None if disaggregated_params is None else disaggregated_params.encoded_opaque_state,
-        None if disaggregated_params is None else disaggregated_params.ctx_info_endpoint,
-    )
-    if signature is None:
+    if not request_requires_internal_disagg_auth(request):
         return {}
+    if not internal_disagg_auth_key:
+        _warn_missing_auth_key()
+        return {}
+    signature = sign_disaggregated_payload(internal_disagg_auth_key, _auth_payload(request))
     return {INTERNAL_DISAGG_AUTH_HEADER: signature}
 
 
@@ -135,11 +80,14 @@ def validate_internal_disagg_request(
     request: UCompletionRequest,
     headers: Optional[Mapping[str, str]],
 ) -> None:
-    disaggregated_params = request.disaggregated_params
+    if not request_requires_internal_disagg_auth(request):
+        return
+    if not internal_disagg_auth_key:
+        _warn_missing_auth_key()
+        return
     provided = None if headers is None else headers.get(INTERNAL_DISAGG_AUTH_HEADER)
-    validate_internal_disagg_auth_signature(
+    validate_disaggregated_payload(
         internal_disagg_auth_key,
-        None if disaggregated_params is None else disaggregated_params.encoded_opaque_state,
-        None if disaggregated_params is None else disaggregated_params.ctx_info_endpoint,
+        _auth_payload(request),
         provided,
     )

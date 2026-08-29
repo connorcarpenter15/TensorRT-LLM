@@ -4,8 +4,10 @@
 """OpenEngine inference service backed by one TensorRT-LLM LLM instance."""
 
 import asyncio
+import functools
 import uuid
 from collections.abc import AsyncGenerator
+from concurrent.futures import Executor
 from dataclasses import replace
 from typing import Any
 
@@ -21,16 +23,11 @@ from openengine.v1 import (
 
 import tensorrt_llm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
+from tensorrt_llm.llmapi.disagg_utils import get_global_disagg_request_id
 from tensorrt_llm.logger import logger
 from tensorrt_llm.scheduling_params import SchedulingParams
 
-from .converters import (
-    decode_handoff,
-    encode_handoff,
-    stable_request_id,
-    to_priority,
-    to_sampling_params,
-)
+from .converters import decode_handoff, encode_handoff, to_priority, to_sampling_params
 
 SCHEMA_RELEASE = "768a93c7b44e40f28c692ad0b471a8f2"
 SCHEMA_REVISION = 1
@@ -69,6 +66,8 @@ class OpenEngineServicer(
         model: str,
         role: int,
         internal_disagg_auth_key: str | None = None,
+        input_processor_executor: Executor | None = None,
+        response_drain_timeout: float = 30.0,
     ) -> None:
         if role not in (
             server_pb2.ENGINE_ROLE_AGGREGATED,
@@ -76,14 +75,25 @@ class OpenEngineServicer(
             server_pb2.ENGINE_ROLE_DECODE,
         ):
             raise ValueError(f"Unsupported OpenEngine role {role}")
+        if getattr(llm, "tokenizer", None) is None:
+            raise ValueError("OpenEngine requires tokenizer initialization")
+        if role != server_pb2.ENGINE_ROLE_AGGREGATED and not internal_disagg_auth_key:
+            raise ValueError(
+                "OpenEngine prefill and decode roles require internal_request_auth_key"
+            )
+        if response_drain_timeout <= 0:
+            raise ValueError("response_drain_timeout must be greater than zero")
         self.llm = llm
         self.model = model
         self.model_id = str(_arg(llm, "model", model) or model)
         self._accepted_model_names = {model, self.model_id}
         self.role = role
         self.internal_disagg_auth_key = internal_disagg_auth_key
+        self._input_processor_executor = input_processor_executor
+        self._response_drain_timeout = response_drain_timeout
+        self._disagg_node_id = uuid.getnode() % 256
         self.instance_id = str(uuid.uuid4())
-        self._requests: dict[str, object] = {}
+        self._requests: dict[str, object | None] = {}
 
     @staticmethod
     def _request_metadata(context: grpc.aio.ServicerContext) -> dict[str, str]:
@@ -183,7 +193,7 @@ class OpenEngineServicer(
         if self.role == server_pb2.ENGINE_ROLE_PREFILL:
             return DisaggregatedParams(
                 request_type="context_only",
-                disagg_request_id=stable_request_id(request.request_id),
+                disagg_request_id=get_global_disagg_request_id(self._disagg_node_id),
                 ctx_dp_rank=target_dp_rank,
                 schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
             )
@@ -209,7 +219,43 @@ class OpenEngineServicer(
         except (AttributeError, TypeError, ValueError):
             return ""
 
-    def _token_infos(self, token_ids: list[int], logprobs: list[Any]) -> list[Any]:
+    @staticmethod
+    def _candidate_items(
+        values: dict[int, Any],
+        candidate_count: int | None,
+    ) -> list[tuple[int, Any]]:
+        if candidate_count is None:
+            return list(values.items())
+        if candidate_count == 0:
+            return []
+        ranked = sorted(
+            (
+                (candidate_id, candidate)
+                for candidate_id, candidate in values.items()
+                if candidate.rank is not None and 1 <= candidate.rank <= candidate_count
+            ),
+            key=lambda item: item[1].rank,
+        )
+        if len(ranked) < candidate_count:
+            ranked_ids = {candidate_id for candidate_id, _ in ranked}
+            unranked = sorted(
+                (
+                    (candidate_id, candidate)
+                    for candidate_id, candidate in values.items()
+                    if candidate_id not in ranked_ids and candidate.rank is None
+                ),
+                key=lambda item: item[1].logprob,
+                reverse=True,
+            )
+            ranked.extend(unranked[: candidate_count - len(ranked)])
+        return ranked[:candidate_count]
+
+    def _token_infos(
+        self,
+        token_ids: list[int],
+        logprobs: list[Any],
+        candidate_count: int | None,
+    ) -> list[Any]:
         infos: list[generation_pb2.TokenInfo] = []
         for index, token_id in enumerate(token_ids):
             info = generation_pb2.TokenInfo(
@@ -224,7 +270,7 @@ class OpenEngineServicer(
                         info.logprob = sampled.logprob
                         if sampled.rank is not None:
                             info.rank = sampled.rank
-                    for candidate_id, candidate in value.items():
+                    for candidate_id, candidate in self._candidate_items(value, candidate_count):
                         proto = info.candidates.add(
                             token_id=candidate_id,
                             logprob=candidate.logprob,
@@ -256,6 +302,7 @@ class OpenEngineServicer(
             self._token_infos(
                 prompt_token_ids[1:],
                 list(prompt_logprobs)[: len(prompt_token_ids) - 1],
+                getattr(result.sampling_params, "prompt_logprobs", None),
             )
         )
         return generation_pb2.PromptOutput(tokens=tokens)
@@ -311,13 +358,65 @@ class OpenEngineServicer(
             finished.stop_match.eos_token_id = eos_token_id
         return finished
 
+    async def _abort_slow_consumer(
+        self,
+        request_id: str,
+        context: grpc.aio.ServicerContext,
+    ) -> None:
+        result = self._requests.get(request_id)
+        if result is not None and not getattr(result, "finished", False):
+            try:
+                result.abort()
+            except (AssertionError, RuntimeError):
+                logger.warning("Failed to abort stalled OpenEngine request %s", request_id)
+        logger.warning(
+            "Aborting OpenEngine request %s because its client did not drain a response within %.1fs",
+            request_id,
+            self._response_drain_timeout,
+        )
+        await context.abort(
+            grpc.StatusCode.DEADLINE_EXCEEDED,
+            "OpenEngine client did not drain the response stream in time",
+        )
+
     async def Generate(
+        self,
+        request: generation_pb2.GenerateRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncGenerator[generation_pb2.GenerateResponse, None]:
+        """Stream responses while bounding slow-client buffering."""
+        responses = self._generate_responses(request, context)
+        try:
+            async for response in responses:
+                watchdog: asyncio.Task[None] | None = None
+
+                def abort_slow_consumer() -> None:
+                    nonlocal watchdog
+                    watchdog = asyncio.create_task(
+                        self._abort_slow_consumer(request.request_id, context)
+                    )
+
+                timeout = asyncio.get_running_loop().call_later(
+                    self._response_drain_timeout,
+                    abort_slow_consumer,
+                )
+                try:
+                    yield response
+                finally:
+                    timeout.cancel()
+                    if watchdog is not None:
+                        await asyncio.gather(watchdog, return_exceptions=True)
+        finally:
+            await responses.aclose()
+
+    async def _generate_responses(
         self,
         request: generation_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncGenerator[generation_pb2.GenerateResponse, None]:
         """Stream aggregated output or a context-first prefill handoff."""
         result = None
+        request_reserved = False
         terminal_sent = False
         try:
             metadata = self._request_metadata(context)
@@ -341,6 +440,8 @@ class OpenEngineServicer(
                     )
                 target_dp_rank = session_dp_rank
             self._validate_generate(request, target_dp_rank)
+            self._requests[request.request_id] = None
+            request_reserved = True
             disaggregated = self._disaggregated_params(request, target_dp_rank)
             context_usage = (
                 disaggregated.ctx_usage
@@ -358,9 +459,21 @@ class OpenEngineServicer(
                 for key, value in metadata.items()
                 if key in ("traceparent", "tracestate")
             }
+            sampling_params = to_sampling_params(request)
+            preprocess = getattr(self.llm, "preprocess", None)
+            if callable(preprocess):
+                inputs = await asyncio.get_running_loop().run_in_executor(
+                    self._input_processor_executor,
+                    functools.partial(
+                        preprocess,
+                        inputs,
+                        sampling_params,
+                        disaggregated,
+                    ),
+                )
             result = self.llm.generate_async(
                 inputs=inputs,
-                sampling_params=to_sampling_params(request),
+                sampling_params=sampling_params,
                 streaming=True,
                 disaggregated_params=disaggregated,
                 scheduling_params=self._scheduling_params(target_dp_rank),
@@ -370,11 +483,17 @@ class OpenEngineServicer(
             )
             self._requests[request.request_id] = result
         except asyncio.CancelledError:
+            if request_reserved and self._requests.get(request.request_id) is None:
+                self._requests.pop(request.request_id, None)
             raise
         except (TypeError, ValueError) as error:
+            if request_reserved and self._requests.get(request.request_id) is None:
+                self._requests.pop(request.request_id, None)
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
             return
         except RuntimeError as error:
+            if request_reserved and self._requests.get(request.request_id) is None:
+                self._requests.pop(request.request_id, None)
             await context.abort(grpc.StatusCode.INTERNAL, str(error))
             return
 
@@ -384,6 +503,24 @@ class OpenEngineServicer(
         try:
             async for current in result:
                 if context.cancelled():
+                    return
+                if current.error is not None:
+                    logger.error(
+                        "OpenEngine request %s failed: %s",
+                        request.request_id,
+                        current.error,
+                    )
+                    response = generation_pb2.GenerateResponse(
+                        request_id=request.request_id,
+                        error=error_pb2.EngineError(
+                            code=error_pb2.ERROR_CODE_INTERNAL,
+                            message=current.error,
+                            retryable=False,
+                        ),
+                    )
+                    response.usage.CopyFrom(self._usage(current, context_usage))
+                    yield response
+                    terminal_sent = True
                     return
                 if not prompt_sent:
                     prompt = self._prompt_output(current)
@@ -422,17 +559,21 @@ class OpenEngineServicer(
                 for output in current.outputs:
                     token_start = sent_tokens.get(output.index, 0)
                     text_start = sent_text.get(output.index, 0)
-                    token_ids = list(output.token_ids or [])
+                    token_ids = output.token_ids or []
                     text = output.text or ""
                     delta_ids = token_ids[token_start:]
                     delta_text = text[text_start:]
                     if delta_ids or delta_text:
-                        logprobs = list(output.logprobs or [])[token_start:]
+                        logprobs = (output.logprobs or [])[token_start:]
                         yield generation_pb2.GenerateResponse(
                             request_id=request.request_id,
                             token=generation_pb2.TokenOutput(
                                 output_index=output.index,
-                                tokens=self._token_infos(delta_ids, logprobs),
+                                tokens=self._token_infos(
+                                    delta_ids,
+                                    logprobs,
+                                    getattr(result.sampling_params, "logprobs", None),
+                                ),
                                 text=delta_text,
                             ),
                         )
@@ -463,7 +604,7 @@ class OpenEngineServicer(
             raise
         except (RuntimeError, TypeError, ValueError) as error:
             logger.error("OpenEngine request %s failed: %s", request.request_id, error)
-            yield generation_pb2.GenerateResponse(
+            response = generation_pb2.GenerateResponse(
                 request_id=request.request_id,
                 error=error_pb2.EngineError(
                     code=error_pb2.ERROR_CODE_INTERNAL,
@@ -471,6 +612,8 @@ class OpenEngineServicer(
                     retryable=False,
                 ),
             )
+            response.usage.CopyFrom(self._usage(result, context_usage))
+            yield response
         finally:
             if result is not None and not getattr(result, "finished", False):
                 try:

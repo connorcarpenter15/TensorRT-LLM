@@ -1513,7 +1513,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                     llm_args,
                     served_model_name=served_model_name,
                     server_role=server_role,
-                    internal_disagg_auth_key=internal_disagg_auth_key)
+                    internal_disagg_auth_key=internal_disagg_auth_key,
+                    input_processor_workers=num_input_processor_workers)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

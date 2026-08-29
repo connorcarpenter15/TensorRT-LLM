@@ -3,8 +3,12 @@
 
 """Focused protocol-boundary tests for the optional OpenEngine adapter."""
 
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import grpc
 import pytest
 
 pytest.importorskip(
@@ -15,13 +19,18 @@ pytest.importorskip(
 from openengine.v1 import generation_pb2, model_pb2, server_pb2  # noqa: E402
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle  # noqa: E402
+from tensorrt_llm.executor.result import Logprob  # noqa: E402
 from tensorrt_llm.grpc.openengine.converters import (  # noqa: E402
     HANDOFF_ATTRIBUTE,
+    HANDOFF_AUTH_ATTRIBUTE,
     decode_handoff,
     encode_handoff,
     to_sampling_params,
 )
+from tensorrt_llm.grpc.openengine.server import _validate_launch_config  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineServicer  # noqa: E402
+from tensorrt_llm.llmapi.llm import LLM  # noqa: E402
+from tensorrt_llm.sampling_params import SamplingParams  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -35,6 +44,12 @@ class _Context:
 
     async def abort(self, code, details):
         pytest.fail(f"Unexpected gRPC abort: {code}: {details}")
+
+
+class _Tokenizer:
+    def decode(self, token_ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return "".join(f"<{token_id}>" for token_id in token_ids)
 
 
 class _Result:
@@ -54,8 +69,13 @@ class _Result:
         self.prompt_token_ids = [1, 2]
         self.cached_tokens = 0
         self.finished = True
+        self.error = None
         self.disaggregated_params = disaggregated_params
-        self.sampling_params = SimpleNamespace(end_id=2)
+        self.sampling_params = SimpleNamespace(
+            end_id=2,
+            logprobs=None,
+            prompt_logprobs=None,
+        )
 
     def __aiter__(self):
         async def items():
@@ -68,7 +88,7 @@ class _Result:
 
 
 class _Llm:
-    tokenizer = None
+    tokenizer = _Tokenizer()
     disaggregated_params = {"ctx_info_endpoint": ["ctx:1234"]}
 
     def __init__(self, result_factory):
@@ -79,13 +99,21 @@ class _Llm:
             data_parallel_size=1,
             data_parallel_rank=0,
             enable_attention_dp=False,
+            backend="pytorch",
+            disable_overlap_scheduler=False,
+            max_batch_size=1,
         )
         self._result_factory = result_factory
         self.calls = []
 
     def generate_async(self, **kwargs):
         self.calls.append(kwargs)
-        return self._result_factory()
+        result = self._result_factory()
+        sampling_params = kwargs["sampling_params"]
+        if sampling_params.end_id is None:
+            sampling_params.end_id = 2
+        result.sampling_params = sampling_params
+        return result
 
 
 async def _collect(servicer, request):
@@ -131,6 +159,68 @@ async def test_aggregated_generate_streams_engine_output():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "role",
+    [
+        server_pb2.ENGINE_ROLE_AGGREGATED,
+        server_pb2.ENGINE_ROLE_PREFILL,
+    ],
+)
+async def test_engine_failure_is_the_only_terminal_response(role):
+    """Regression: accepted engine failures must not become success responses."""
+    result = _Result()
+    result.error = "engine rejected request"
+    servicer = OpenEngineServicer(
+        _Llm(lambda: result),
+        "model",
+        role,
+        internal_disagg_auth_key=("secret" if role == server_pb2.ENGINE_ROLE_PREFILL else None),
+    )
+
+    responses = await _collect(
+        servicer,
+        generation_pb2.GenerateRequest(request_id="engine-error", prompt="Hi"),
+    )
+
+    assert [response.WhichOneof("event") for response in responses] == ["error"]
+    assert responses[0].error.message == "engine rejected request"
+    assert responses[0].usage.prompt_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_preprocessing_runs_off_the_grpc_event_loop():
+    """Regression: prompt preprocessing must not block concurrent gRPC streams."""
+
+    class _PreprocessingLlm(_Llm):
+        def preprocess(self, inputs, sampling_params, disaggregated_params):
+            self.preprocess_thread = threading.get_ident()
+            self.preprocess_args = (inputs, sampling_params, disaggregated_params)
+            return SimpleNamespace(prompt_token_ids=[1, 2])
+
+        def generate_async(self, **kwargs):
+            self.generate_thread = threading.get_ident()
+            return super().generate_async(**kwargs)
+
+    llm = _PreprocessingLlm(_Result)
+    event_loop_thread = threading.get_ident()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        servicer = OpenEngineServicer(
+            llm,
+            "model",
+            server_pb2.ENGINE_ROLE_AGGREGATED,
+            input_processor_executor=executor,
+        )
+        await _collect(
+            servicer,
+            generation_pb2.GenerateRequest(request_id="preprocess", prompt="Hi"),
+        )
+
+    assert llm.preprocess_thread != event_loop_thread
+    assert llm.generate_thread == event_loop_thread
+    assert llm.calls[0]["inputs"].prompt_token_ids == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_prompt_logprobs_align_with_scored_prompt_tokens():
     """Regression: TRT prompt scores are offset and exclude the first prompt token."""
     result = _Result()
@@ -151,6 +241,36 @@ async def test_prompt_logprobs_align_with_scored_prompt_tokens():
     assert [token.token_id for token in prompt_tokens] == [10, 11]
     assert not prompt_tokens[0].HasField("logprob")
     assert prompt_tokens[1].logprob == pytest.approx(-0.25)
+
+
+@pytest.mark.asyncio
+async def test_output_candidates_exclude_sampled_token_outside_requested_top_n():
+    """Regression: sampled-token metadata must not expand the requested candidate set."""
+    result = _Result()
+    result.outputs[0].token_ids = [7]
+    result.outputs[0].logprobs = [
+        {
+            7: Logprob(logprob=-3.0, rank=3),
+            8: Logprob(logprob=-0.1, rank=1),
+            9: Logprob(logprob=-0.2, rank=2),
+        }
+    ]
+    servicer = OpenEngineServicer(
+        _Llm(lambda: result),
+        "model",
+        server_pb2.ENGINE_ROLE_AGGREGATED,
+    )
+    request = generation_pb2.GenerateRequest(request_id="top-n", prompt="Hi")
+    request.response.return_output_logprobs = True
+    request.response.output_candidates.top_n = 1
+
+    responses = await _collect(servicer, request)
+
+    token = responses[0].token.tokens[0]
+    assert token.token_id == 7
+    assert token.rank == 3
+    assert token.logprob == pytest.approx(-3.0)
+    assert [(candidate.token_id, candidate.rank) for candidate in token.candidates] == [(8, 1)]
 
 
 def test_explicit_zero_num_sequences_is_rejected():
@@ -210,22 +330,141 @@ async def test_prefill_handoff_round_trips_to_decode_params():
     assert decode_responses[-1].WhichOneof("event") == "finished"
 
 
-def test_authenticated_handoff_rejects_tampered_rendezvous_fields():
-    """Regression: clients must not be able to replace protected TRT-LLM handoff data."""
+@pytest.mark.asyncio
+async def test_prefill_retry_mints_a_fresh_transfer_id():
+    """Regression: a retried wire request must not alias a live KV transfer."""
+
+    class _PrefillLlm(_Llm):
+        def generate_async(self, **kwargs):
+            self._result_factory = lambda: _Result(kwargs["disaggregated_params"])
+            return super().generate_async(**kwargs)
+
+    servicer = OpenEngineServicer(
+        _PrefillLlm(_Result),
+        "model",
+        server_pb2.ENGINE_ROLE_PREFILL,
+        internal_disagg_auth_key="secret",
+    )
+    request = generation_pb2.GenerateRequest(request_id="retry", prompt="Hi")
+
+    first = await _collect(servicer, request)
+    second = await _collect(servicer, request)
+
+    assert first[0].prefill_ready.kv_session.session_id
+    assert first[0].prefill_ready.kv_session.session_id != (
+        second[0].prefill_ready.kv_session.session_id
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["session_id", "dp_rank", "token_state", "strip_fields", "remove_auth"],
+)
+def test_authenticated_handoff_rejects_tampering(tamper):
+    """Regression: every routing and transfer field must be integrity protected."""
     session = encode_handoff(
         DisaggregatedParams(
             request_type="context_only",
+            first_gen_tokens=[9],
             ctx_request_id=77,
             opaque_state=b"opaque",
             disagg_request_id=88,
+            ctx_dp_rank=0,
             ctx_info_endpoint="ctx:1234",
             schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
         ),
         internal_disagg_auth_key="secret",
     )
-    session.attributes_struct.fields[HANDOFF_ATTRIBUTE].struct_value.fields[
-        "ctx_info_endpoint"
-    ].string_value = "attacker:9999"
+    fields = session.attributes_struct.fields
+    handoff_fields = fields[HANDOFF_ATTRIBUTE].struct_value.fields
+    if tamper == "session_id":
+        session.session_id = "99"
+    elif tamper == "dp_rank":
+        session.dp_rank = 1
+    elif tamper == "token_state":
+        handoff_fields["first_gen_tokens"].list_value.values[0].number_value = 10
+    elif tamper == "strip_fields":
+        del handoff_fields["opaque_state"]
+        del handoff_fields["ctx_info_endpoint"]
+    else:
+        del fields[HANDOFF_AUTH_ATTRIBUTE]
 
     with pytest.raises(ValueError, match="Invalid internal"):
         decode_handoff(session, internal_disagg_auth_key="secret")
+
+
+def test_tokenizerless_launch_is_rejected_at_real_preparation_boundary():
+    """Regression: advertised text inputs must be executable by the real LLM API."""
+    real_preparation = SimpleNamespace(
+        args=SimpleNamespace(backend="tensorrt"),
+        tokenizer=None,
+        _apply_generation_config_sampling_defaults=lambda sampling_params: None,
+    )
+    with pytest.raises(ValueError, match="tokenizer is required"):
+        LLM._prepare_sampling_params(real_preparation, SamplingParams())
+    with pytest.raises(ValueError, match="skip_tokenizer_init"):
+        _validate_launch_config(
+            {"backend": "pytorch", "skip_tokenizer_init": True},
+            server_pb2.ENGINE_ROLE_AGGREGATED,
+            None,
+        )
+
+
+def test_autodeploy_prefill_requires_overlap_disabled_at_startup():
+    """Regression: reject AutoDeploy prefill configurations that fail every request."""
+    with pytest.raises(ValueError, match="disable_overlap_scheduler"):
+        _validate_launch_config(
+            {"backend": "_autodeploy", "disable_overlap_scheduler": False},
+            server_pb2.ENGINE_ROLE_PREFILL,
+            "secret",
+        )
+
+
+@pytest.mark.asyncio
+async def test_slow_consumer_aborts_the_engine_request():
+    """Regression: a stalled reader must not leave an unbounded engine stream running."""
+
+    class _StreamingResult(_Result):
+        def __init__(self):
+            super().__init__()
+            self.finished = False
+            self.aborted = False
+
+        def __aiter__(self):
+            async def items():
+                yield self
+                await asyncio.Event().wait()
+
+            return items()
+
+        def abort(self):
+            self.aborted = True
+
+    class _AbortContext(_Context):
+        def __init__(self):
+            self.aborted = None
+
+        async def abort(self, code, details):
+            self.aborted = (code, details)
+
+    result = _StreamingResult()
+    context = _AbortContext()
+    servicer = OpenEngineServicer(
+        _Llm(lambda: result),
+        "model",
+        server_pb2.ENGINE_ROLE_AGGREGATED,
+        response_drain_timeout=0.01,
+    )
+    stream = servicer.Generate(
+        generation_pb2.GenerateRequest(request_id="slow-reader", prompt="Hi"),
+        context,
+    )
+
+    response = await stream.__anext__()
+    assert response.WhichOneof("event") == "token"
+    await asyncio.sleep(0.05)
+
+    assert result.aborted
+    assert context.aborted is not None
+    assert context.aborted[0] == grpc.StatusCode.DEADLINE_EXCEEDED
+    await stream.aclose()
